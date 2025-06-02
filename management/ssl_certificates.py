@@ -241,138 +241,145 @@ def get_certificates_to_provision(env, limit_domains=None, show_valid_certs=True
 	return (domains_to_provision, domains_cant_provision)
 
 def provision_certificates(env, limit_domains):
-	# What domains should we provision certificates for? And what
-	# errors prevent provisioning for other domains.
-	domains, domains_cant_provision = get_certificates_to_provision(env, limit_domains=limit_domains)
+  
+  # Custom patch: Disable Let's Encrypt provisioning.
+	# TLS certificates are managed externally (e.g. via NFS).
+	print("🛑 Let's Encrypt integration is DISABLED by custom patch.")
+	print("🔒 Using external manually-managed certificates instead.")
+	return []
+  
+	# # What domains should we provision certificates for? And what
+	# # errors prevent provisioning for other domains.
+	# domains, domains_cant_provision = get_certificates_to_provision(env, limit_domains=limit_domains)
 
-	# Build a list of what happened on each domain or domain-set.
-	ret = []
-	for domain, error in domains_cant_provision.items():
-		ret.append({
-			"domains": [domain],
-			"log": [error],
-			"result": "skipped",
-		})
+	# # Build a list of what happened on each domain or domain-set.
+	# ret = []
+	# for domain, error in domains_cant_provision.items():
+	# 	ret.append({
+	# 		"domains": [domain],
+	# 		"log": [error],
+	# 		"result": "skipped",
+	# 	})
 
-	# Break into groups by DNS zone: Group every domain with its parent domain, if
-	# its parent domain is in the list of domains to request a certificate for.
-	# Start with the zones so that if the zone doesn't need a certificate itself,
-	# its children will still be grouped together. Sort the provision domains to
-	# put parents ahead of children.
-	# Since Let's Encrypt requests are limited to 100 domains at a time,
-	# we'll create a list of lists of domains where the inner lists have
-	# at most 100 items. By sorting we also get the DNS zone domain as the first
-	# entry in each list (unless we overflow beyond 100) which ends up as the
-	# primary domain listed in each certificate.
-	from dns_update import get_dns_zones
-	certs = { }
-	for zone, _zonefile in get_dns_zones(env):
-		certs[zone] = [[]]
-	for domain in sort_domains(domains, env):
-		# Does the domain end with any domain we've seen so far.
-		for parent in certs:
-			if domain.endswith("." + parent):
-				# Add this to the parent's list of domains.
-				# Start a new group if the list already has
-				# 100 items.
-				if len(certs[parent][-1]) == 100:
-					certs[parent].append([])
-				certs[parent][-1].append(domain)
-				break
-		else:
-			# This domain is not a child of any domain we've seen yet, so
-			# start a new group. This shouldn't happen since every zone
-			# was already added.
-			certs[domain] = [[domain]]
+	# # Break into groups by DNS zone: Group every domain with its parent domain, if
+	# # its parent domain is in the list of domains to request a certificate for.
+	# # Start with the zones so that if the zone doesn't need a certificate itself,
+	# # its children will still be grouped together. Sort the provision domains to
+	# # put parents ahead of children.
+	# # Since Let's Encrypt requests are limited to 100 domains at a time,
+	# # we'll create a list of lists of domains where the inner lists have
+	# # at most 100 items. By sorting we also get the DNS zone domain as the first
+	# # entry in each list (unless we overflow beyond 100) which ends up as the
+	# # primary domain listed in each certificate.
+	# from dns_update import get_dns_zones
+	# certs = { }
+	# for zone, _zonefile in get_dns_zones(env):
+	# 	certs[zone] = [[]]
+	# for domain in sort_domains(domains, env):
+	# 	# Does the domain end with any domain we've seen so far.
+	# 	for parent in certs:
+	# 		if domain.endswith("." + parent):
+	# 			# Add this to the parent's list of domains.
+	# 			# Start a new group if the list already has
+	# 			# 100 items.
+	# 			if len(certs[parent][-1]) == 100:
+	# 				certs[parent].append([])
+	# 			certs[parent][-1].append(domain)
+	# 			break
+	# 	else:
+	# 		# This domain is not a child of any domain we've seen yet, so
+	# 		# start a new group. This shouldn't happen since every zone
+	# 		# was already added.
+	# 		certs[domain] = [[domain]]
 
-	# Flatten to a list of lists of domains (from a mapping). Remove empty
-	# lists (zones with no domains that need certs).
-	certs = functools.reduce(operator.iadd, certs.values(), [])
-	certs = [_ for _ in certs if len(_) > 0]
+	# # Flatten to a list of lists of domains (from a mapping). Remove empty
+	# # lists (zones with no domains that need certs).
+	# certs = functools.reduce(operator.iadd, certs.values(), [])
+	# certs = [_ for _ in certs if len(_) > 0]
 
-	# Prepare to provision.
+	# # Prepare to provision.
 
-	# Where should we put our Let's Encrypt account info and state cache.
-	account_path = os.path.join(env['STORAGE_ROOT'], 'ssl/lets_encrypt')
-	if not os.path.exists(account_path):
-		os.mkdir(account_path)
+	# # Where should we put our Let's Encrypt account info and state cache.
+	# account_path = os.path.join(env['STORAGE_ROOT'], 'ssl/lets_encrypt')
+	# if not os.path.exists(account_path):
+	# 	os.mkdir(account_path)
 
-	# Provision certificates.
-	for domain_list in certs:
-		ret.append({
-			"domains": domain_list,
-			"log": [],
-		})
-		try:
-			# Create a CSR file for our master private key so that certbot
-			# uses our private key.
-			key_file = os.path.join(env['STORAGE_ROOT'], 'ssl', 'ssl_private_key.pem')
-			with tempfile.NamedTemporaryFile() as csr_file:
-				# We could use openssl, but certbot requires
-				# that the CN domain and SAN domains match
-				# the domain list passed to certbot, and adding
-				# SAN domains openssl req is ridiculously complicated.
-				# subprocess.check_output([
-				# 	"openssl", "req", "-new",
-				# 	"-key", key_file,
-				# 	"-out", csr_file.name,
-				# 	"-subj", "/CN=" + domain_list[0],
-				# 	"-sha256" ])
-				from cryptography import x509
-				from cryptography.hazmat.backends import default_backend
-				from cryptography.hazmat.primitives.serialization import Encoding
-				from cryptography.hazmat.primitives import hashes
-				from cryptography.x509.oid import NameOID
-				builder = x509.CertificateSigningRequestBuilder()
-				builder = builder.subject_name(x509.Name([ x509.NameAttribute(NameOID.COMMON_NAME, domain_list[0]) ]))
-				builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-				builder = builder.add_extension(x509.SubjectAlternativeName(
-					[x509.DNSName(d) for d in domain_list]
-				), critical=False)
-				request = builder.sign(load_pem(load_cert_chain(key_file)[0]), hashes.SHA256(), default_backend())
-				with open(csr_file.name, "wb") as f:
-					f.write(request.public_bytes(Encoding.PEM))
+	# # Provision certificates.
+	# for domain_list in certs:
+	# 	ret.append({
+	# 		"domains": domain_list,
+	# 		"log": [],
+	# 	})
+	# 	try:
+	# 		# Create a CSR file for our master private key so that certbot
+	# 		# uses our private key.
+	# 		key_file = os.path.join(env['STORAGE_ROOT'], 'ssl', 'ssl_private_key.pem')
+	# 		with tempfile.NamedTemporaryFile() as csr_file:
+	# 			# We could use openssl, but certbot requires
+	# 			# that the CN domain and SAN domains match
+	# 			# the domain list passed to certbot, and adding
+	# 			# SAN domains openssl req is ridiculously complicated.
+	# 			# subprocess.check_output([
+	# 			# 	"openssl", "req", "-new",
+	# 			# 	"-key", key_file,
+	# 			# 	"-out", csr_file.name,
+	# 			# 	"-subj", "/CN=" + domain_list[0],
+	# 			# 	"-sha256" ])
+	# 			from cryptography import x509
+	# 			from cryptography.hazmat.backends import default_backend
+	# 			from cryptography.hazmat.primitives.serialization import Encoding
+	# 			from cryptography.hazmat.primitives import hashes
+	# 			from cryptography.x509.oid import NameOID
+	# 			builder = x509.CertificateSigningRequestBuilder()
+	# 			builder = builder.subject_name(x509.Name([ x509.NameAttribute(NameOID.COMMON_NAME, domain_list[0]) ]))
+	# 			builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+	# 			builder = builder.add_extension(x509.SubjectAlternativeName(
+	# 				[x509.DNSName(d) for d in domain_list]
+	# 			), critical=False)
+	# 			request = builder.sign(load_pem(load_cert_chain(key_file)[0]), hashes.SHA256(), default_backend())
+	# 			with open(csr_file.name, "wb") as f:
+	# 				f.write(request.public_bytes(Encoding.PEM))
 
-				# Provision, writing to a temporary file.
-				webroot = os.path.join(account_path, 'webroot')
-				os.makedirs(webroot, exist_ok=True)
-				with tempfile.TemporaryDirectory() as d:
-					cert_file = os.path.join(d, 'cert_and_chain.pem')
-					print("Provisioning TLS certificates for " + ", ".join(domain_list) + ".")
-					certbotret = subprocess.check_output([
-						"certbot",
-						"certonly",
-						#"-v", # just enough to see ACME errors
-						"--non-interactive", # will fail if user hasn't registered during Mail-in-a-Box setup
+	# 			# Provision, writing to a temporary file.
+	# 			webroot = os.path.join(account_path, 'webroot')
+	# 			os.makedirs(webroot, exist_ok=True)
+	# 			with tempfile.TemporaryDirectory() as d:
+	# 				cert_file = os.path.join(d, 'cert_and_chain.pem')
+	# 				print("Provisioning TLS certificates for " + ", ".join(domain_list) + ".")
+	# 				certbotret = subprocess.check_output([
+	# 					"certbot",
+	# 					"certonly",
+	# 					#"-v", # just enough to see ACME errors
+	# 					"--non-interactive", # will fail if user hasn't registered during Mail-in-a-Box setup
 
-						"-d", ",".join(domain_list), # first will be main domain
+	# 					"-d", ",".join(domain_list), # first will be main domain
 
-						"--csr", csr_file.name, # use our private key; unfortunately this doesn't work with auto-renew so we need to save cert manually
-						"--cert-path", os.path.join(d, 'cert'), # we only use the full chain
-						"--chain-path", os.path.join(d, 'chain'), # we only use the full chain
-						"--fullchain-path", cert_file,
+	# 					"--csr", csr_file.name, # use our private key; unfortunately this doesn't work with auto-renew so we need to save cert manually
+	# 					"--cert-path", os.path.join(d, 'cert'), # we only use the full chain
+	# 					"--chain-path", os.path.join(d, 'chain'), # we only use the full chain
+	# 					"--fullchain-path", cert_file,
 
-						"--webroot", "--webroot-path", webroot,
+	# 					"--webroot", "--webroot-path", webroot,
 
-						"--config-dir", account_path,
-						#"--staging",
-					], stderr=subprocess.STDOUT).decode("utf8")
-					install_cert_copy_file(cert_file, env)
+	# 					"--config-dir", account_path,
+	# 					#"--staging",
+	# 				], stderr=subprocess.STDOUT).decode("utf8")
+	# 				install_cert_copy_file(cert_file, env)
 
-			ret[-1]["log"].append(certbotret)
-			ret[-1]["result"] = "installed"
-		except subprocess.CalledProcessError as e:
-			ret[-1]["log"].append(e.output.decode("utf8"))
-			ret[-1]["result"] = "error"
-		except Exception as e:
-			ret[-1]["log"].append(str(e))
-			ret[-1]["result"] = "error"
+	# 		ret[-1]["log"].append(certbotret)
+	# 		ret[-1]["result"] = "installed"
+	# 	except subprocess.CalledProcessError as e:
+	# 		ret[-1]["log"].append(e.output.decode("utf8"))
+	# 		ret[-1]["result"] = "error"
+	# 	except Exception as e:
+	# 		ret[-1]["log"].append(str(e))
+	# 		ret[-1]["result"] = "error"
 
-	# Run post-install steps.
-	ret.extend(post_install_func(env))
+	# # Run post-install steps.
+	# ret.extend(post_install_func(env))
 
-	# Return what happened with each certificate request.
-	return ret
+	# # Return what happened with each certificate request.
+	# return ret
 
 def provision_certificates_cmdline():
 	import sys
