@@ -244,8 +244,8 @@ def provision_certificates(env, limit_domains):
   
   # Custom patch: Disable Let's Encrypt provisioning.
 	# TLS certificates are managed externally (e.g. via NFS).
-	print("🛑 Let's Encrypt integration is DISABLED by custom patch.")
-	print("🔒 Using external manually-managed certificates instead.")
+	# print("🛑 Let's Encrypt integration is DISABLED by custom patch.")
+	# print("🔒 Using external manually-managed certificates instead.")
 	return []
   
 	# # What domains should we provision certificates for? And what
